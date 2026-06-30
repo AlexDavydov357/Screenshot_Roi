@@ -78,8 +78,8 @@ Thumbs.db
 *.7z
 
 # Executables
-*.exe
 *.msi
+*.exe
 *.bat
 *.lnk
 *.wav
