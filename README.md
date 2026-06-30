@@ -49,6 +49,7 @@ python screenshot_roi.py
 ✅ Предкомпилированная версия (screenshot_roi.exe) доступна в разделе Releases GitHub.
 
 **Как использовать:**</br>
+Перейдите на https://github.com/AlexDavydov357/Screenshot_Roi/releases/tag/screenshot </br>
 Скачайте screenshot_roi.exe из latest release.</br>
 Запустите двойным кликом — не требует Python или установки зависимостей!</br>
 Работает на Windows 7+ (64-bit рекомендуется).</br>
