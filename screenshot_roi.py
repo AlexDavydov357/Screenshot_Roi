@@ -32,6 +32,31 @@ MONITORENUMPROC = ctypes.WINFUNCTYPE(
 )
 
 
+def _set_dpi_awareness():
+    """Включает DPI-осведомлённость процесса, чтобы координаты мониторов из EnumDisplayMonitors
+        были в тех же физических пикселях, что и снимок ImageGrab.grab(all_screens=True).
+        Без этого при масштабе Windows 125%/150% координаты «съезжают».
+    """
+    try:
+        # Per-Monitor v2 (Windows 10 1703+)
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+_set_dpi_awareness()
+
+
 def _get_monitors():
     """Возвращает список мониторов: [(x, y, w, h), ...] в физических пикселях
         Использует Windows API (EnumDisplayMonitors + callback) для получения точных координат.
@@ -166,7 +191,7 @@ def InfoMessageBox(title: str, text: str, show_time: int, style: int = 0, sound:
 
 class ROISelectorPanel(wx.ScrolledWindow):
     def __init__(self, parent, pil_image: Image.Image):
-        super().__init__(parent, style=wx.VSCROLL | wx.HSCROLL)
+        super().__init__(parent, style=wx.VSCROLL | wx.HSCROLL | wx.WANTS_CHARS)
 
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_PAINT, self.on_paint)
@@ -174,6 +199,11 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
         self.Bind(wx.EVT_SIZE, self.on_size)
+        self.Bind(wx.EVT_KEY_DOWN, self.on_key_down)
+        self.Bind(wx.EVT_KEY_UP, self.on_key_up)
+
+        # Удерживаемая клавиша «-» для уменьшения ROI стрелками
+        self._held_keys = set()
 
         # Оригинальное изображение (PIL)
         self.original_pil = pil_image
@@ -184,6 +214,9 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.start_point = None
         self.current_point = None
         self.final_roi = None  # (x1, y1, x2, y2)
+
+        # История обрезок (для отмены)
+        self.crop_history = []
 
         # Подготовка к отображению
         self._update_display_image()
@@ -215,6 +248,7 @@ class ROISelectorPanel(wx.ScrolledWindow):
 
     def on_left_down(self, event):
         """Начало выделения ROI: сохраняет начальную точку в координатах оригинального изображения."""
+        self.SetFocus()  # чтобы стрелки клавиатуры приходили в панель
         pos = event.GetPosition()
         x, y = self._screen_to_original(pos)
         self.start_point = (x, y)
@@ -240,6 +274,78 @@ class ROISelectorPanel(wx.ScrolledWindow):
             pos = event.GetPosition()
             self.current_point = self._screen_to_original(pos)
             self.Refresh()
+
+    # Коды клавиши «-» (основная клавиатура и цифровой блок)
+    _MINUS_KEYS = {ord('-'), wx.WXK_SUBTRACT, wx.WXK_NUMPAD_SUBTRACT}
+    _ARROW_KEYS = {wx.WXK_LEFT, wx.WXK_RIGHT, wx.WXK_UP, wx.WXK_DOWN,
+                   wx.WXK_NUMPAD_LEFT, wx.WXK_NUMPAD_RIGHT, wx.WXK_NUMPAD_UP, wx.WXK_NUMPAD_DOWN}
+
+    def on_key_down(self, event):
+        """Стрелки двигают ROI; Shift + стрелка расширяет ROI в сторону стрелки,
+            «-» + стрелка сужает ROI в сторону стрелки. С Ctrl шаг 10 пикселей вместо 1.
+            """
+        key = event.GetKeyCode()
+        if key in self._MINUS_KEYS:
+            self._held_keys.add(key)
+            return
+        if key not in self._ARROW_KEYS or not self.final_roi:
+            event.Skip()
+            return
+
+        dx = {wx.WXK_LEFT: -1, wx.WXK_NUMPAD_LEFT: -1, wx.WXK_RIGHT: 1, wx.WXK_NUMPAD_RIGHT: 1}.get(key, 0)
+        dy = {wx.WXK_UP: -1, wx.WXK_NUMPAD_UP: -1, wx.WXK_DOWN: 1, wx.WXK_NUMPAD_DOWN: 1}.get(key, 0)
+        step = 10 if event.ControlDown() else 1
+
+        if event.ShiftDown():
+            self.resize_roi(dx * step, dy * step, grow=True)
+        elif self._held_keys & self._MINUS_KEYS:
+            self.resize_roi(dx * step, dy * step, grow=False)
+        else:
+            self.move_roi(dx * step, dy * step)
+
+    def on_key_up(self, event):
+        """Отпускание «-»: стрелки снова двигают ROI целиком."""
+        self._held_keys.discard(event.GetKeyCode())
+        event.Skip()
+
+    def move_roi(self, dx, dy):
+        """Сдвигает ROI на (dx, dy) пикселей оригинала, не выходя за границы изображения."""
+        x1, y1, x2, y2 = self.final_roi
+        orig_w, orig_h = self.original_pil.size
+        dx = max(-x1, min(dx, orig_w - x2))
+        dy = max(-y1, min(dy, orig_h - y2))
+        self.final_roi = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+        self.Refresh()
+
+    def resize_roi(self, dx, dy, grow: bool):
+        """Меняет размер ROI в направлении стрелки (dx, dy).
+
+            grow=True  — граница со стороны стрелки уходит наружу (← двигает левую границу влево и т.д.);
+            grow=False — противоположная граница идёт внутрь по стрелке (← двигает правую границу влево и т.д.).
+            Минимальный размер ROI — 1 пиксель, ROI не выходит за границы изображения.
+            """
+        x1, y1, x2, y2 = self.final_roi
+        orig_w, orig_h = self.original_pil.size
+        if grow:
+            if dx < 0:
+                x1 = max(0, x1 + dx)
+            elif dx > 0:
+                x2 = min(orig_w, x2 + dx)
+            if dy < 0:
+                y1 = max(0, y1 + dy)
+            elif dy > 0:
+                y2 = min(orig_h, y2 + dy)
+        else:
+            if dx < 0:
+                x2 = max(x1 + 1, x2 + dx)
+            elif dx > 0:
+                x1 = min(x2 - 1, x1 + dx)
+            if dy < 0:
+                y2 = max(y1 + 1, y2 + dy)
+            elif dy > 0:
+                y1 = min(y2 - 1, y1 + dy)
+        self.final_roi = (x1, y1, x2, y2)
+        self.Refresh()
 
     def _screen_to_original(self, screen_pos):
         """Преобразует экранные координаты (пиксели окна) в координаты оригинального изображения.
@@ -292,7 +398,7 @@ class ROISelectorPanel(wx.ScrolledWindow):
         y = (client_h - h) // 2
         dc.DrawBitmap(bitmap, x, y, True)
 
-        # Рисуем выделение (в координатах экрана)
+        # Рисуем прямоугольник (в координатах экрана)
         if self.start_point and self.current_point:
             x1_s, y1_s = self._original_to_screen(self.start_point)
             x2_s, y2_s = self._original_to_screen(self.current_point)
@@ -338,6 +444,42 @@ class ROISelectorPanel(wx.ScrolledWindow):
             return self.original_pil
         x1, y1, x2, y2 = self.final_roi
         return self.original_pil.crop((x1, y1, x2, y2))
+
+    def set_image(self, pil_image: Image.Image):
+        """Загружает новый скриншот: сбрасывает выделение и историю обрезок."""
+        self.crop_history = []
+        self._show_image(pil_image.convert("RGB"))
+
+    def _show_image(self, pil_image: Image.Image):
+        """Показывает изображение в панели и сбрасывает выделение."""
+        self.original_pil = pil_image
+        self.display_pil = pil_image.copy()
+        self.final_roi = None
+        self.start_point = None
+        self.current_point = None
+        self._update_display_image()
+        self.Refresh()
+
+    def crop_to_roi(self) -> bool:
+        """Обрезает изображение по выделенной области (ROI); прежнее изображение кладётся в историю.
+
+            Возвращает False, если область не выбрана или имеет нулевой размер.
+            """
+        if not self.final_roi:
+            return False
+        x1, y1, x2, y2 = self.final_roi
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            return False
+        self.crop_history.append(self.original_pil)
+        self._show_image(self.original_pil.crop((x1, y1, x2, y2)))
+        return True
+
+    def undo_crop(self) -> bool:
+        """Возвращает изображение, каким оно было до последней обрезки. False — если отменять нечего."""
+        if not self.crop_history:
+            return False
+        self._show_image(self.crop_history.pop())
+        return True
 
     def copy_to_clipboard(self):
         """Копирует выделенную область (ROI) в буфер обмена как wx.Bitmap.
@@ -428,22 +570,43 @@ class MainFrame(wx.Frame):
         self.btn_save = wx.Button(btn_panel, label="💾 Сохранить в PNG")
         self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
         # self.btn_save.Enable(False)
-        self.btn_copy = wx.Button(btn_panel, label="📋 Копировать в буфер обмена")
+        self.btn_save_as = wx.Button(btn_panel, label="💾 Сохранить как...")
+        self.btn_save_as.Bind(wx.EVT_BUTTON, self.on_save_as)
+        self.btn_copy =wx.Button(btn_panel, label="📋 Копировать в буфер обмена")
         self.btn_copy.Bind(wx.EVT_BUTTON, self.on_copy)
         # self.btn_copy.Enable(False)
 
         self.btn_refresh = wx.Button(btn_panel, label="🔄 Обновить скриншот")
         self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+
+        self.btn_crop = wx.Button(btn_panel, label="✂️ Обрезать по выделению")
+        self.btn_crop.Bind(wx.EVT_BUTTON, self.on_crop)
+        self.btn_undo_crop = wx.Button(btn_panel, label="↩️ Отменить обрезку")
+        self.btn_undo_crop.Bind(wx.EVT_BUTTON, self.on_undo_crop)
+        self.btn_undo_crop.Enable(False)
+
+        self.btn_info = wx.Button(btn_panel, label="ℹ️ Управление")
+        self.btn_info.Bind(wx.EVT_BUTTON, self.on_info)
+
         btn_sizer.Add(self.btn_save, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_save_as, 0, wx.ALL, 5)
         btn_sizer.Add(self.btn_refresh, 0, wx.ALL, 5)
         btn_sizer.Add(self.btn_copy, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_crop, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_undo_crop, 0, wx.ALL, 5)
+        btn_sizer.AddStretchSpacer()
+        btn_sizer.Add(self.btn_info, 0, wx.ALL, 5)
         btn_panel.SetSizer(btn_sizer)
 
         # Создаём таблицу горячих клавиш
         self.accel_tbl = wx.AcceleratorTable([
             (wx.ACCEL_CTRL, ord('S'), self.btn_save.GetId()),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('S'), self.btn_save_as.GetId()),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('C'), self.btn_copy.GetId()),
             (wx.ACCEL_CTRL, ord('R'), self.btn_refresh.GetId()),
+            (wx.ACCEL_CTRL, ord('X'), self.btn_crop.GetId()),
+            (wx.ACCEL_CTRL, ord('Z'), self.btn_undo_crop.GetId()),
+            (wx.ACCEL_NORMAL, wx.WXK_F1, self.btn_info.GetId()),
         ])
         self.SetAcceleratorTable(self.accel_tbl)
 
@@ -461,6 +624,13 @@ class MainFrame(wx.Frame):
         self.Maximize(True)
         self.Centre()
         self.Show()
+
+        # Глобальная горячая клавиша PrtScr: работает, даже когда окно свёрнуто или неактивно
+        self.Bind(wx.EVT_HOTKEY, self.on_prtscr, id=self.HOTKEY_PRTSCR_ID)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        if not self.RegisterHotKey(self.HOTKEY_PRTSCR_ID, 0, wx.WXK_SNAPSHOT):
+            print("[DEBUG] Не удалось зарегистрировать PrtScr: клавиша занята другой программой "
+                  "(или включена настройка Windows «Использовать PrtScn для открытия Ножниц»)")
 
     def _load_save_dir(self):
         """Загружает путь к папке сохранения из JSON-конфига (по умолчанию: ~/Screenshots).
@@ -500,9 +670,37 @@ class MainFrame(wx.Frame):
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = self.save_dir / f"roi_{timestamp}.png"
+        self._save_image(roi, filename)
 
+    def on_save_as(self, event):
+        """Сохраняет выделенную область (ROI) в файл, имя и папку которого задаёт пользователь."""
+        roi = self.panel.get_roi_image()
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with wx.FileDialog(self, "Сохранить как", defaultDir=str(self.save_dir),
+                           defaultFile=f"roi_{timestamp}.png",
+                           wildcard="PNG (*.png)|*.png|JPEG (*.jpg)|*.jpg|BMP (*.bmp)|*.bmp",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            filename = Path(dlg.GetPath())
+            ext = [".png", ".jpg", ".bmp"][dlg.GetFilterIndex()]
+        if filename.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp"):
+            filename = filename.with_name(filename.name + ext)
+        # Запоминаем выбранную папку до закрытия программы (в конфиг не пишем — путь по умолчанию не меняется)
+        self.save_dir = filename.parent
+        self.txt_folder.SetValue(str(self.save_dir))
+        self._save_image(roi, filename)
+
+    def _save_image(self, roi: Image.Image, filename: Path):
+        """Сохраняет изображение в файл; формат определяется по расширению."""
+        formats = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP"}
+        fmt = formats.get(filename.suffix.lower(), "PNG")
         try:
-            roi.save(filename, "PNG", optimize=True)
+            if fmt == "PNG":
+                roi.save(filename, fmt, optimize=True)
+            else:
+                roi.convert("RGB").save(filename, fmt)
             # wx.MessageBox(f"Сохранено: {filename}", "Успех", wx.OK | wx.ICON_INFORMATION)
             InfoMessageBox(title="Успех", text=f"Сохранено: {filename}", show_time=5, style=0, sound=1)
         except Exception as e:
@@ -518,6 +716,51 @@ class MainFrame(wx.Frame):
             #wx.MessageBox("Не удалось скопировать ROI.", "Ошибка", wx.OK | wx.ICON_ERROR)
             InfoMessageBox(title="Ошибка", text="ROI скопирован в буфер обмена!", show_time=3, style=1, sound=1)
 
+    HOTKEY_PRTSCR_ID = 0xB001  # id глобальной горячей клавиши PrtScr (0x0000–0xBFFF для приложений)
+
+    # Список клавиш управления для окна «Управление»: (клавиши, действие); None — заголовок раздела
+    HELP_KEYS = [
+        (None, "Кнопки"),
+        ("PrtScr", "Новый снимок экрана (работает и из свёрнутого окна)"),
+        ("Ctrl + S", "Сохранить в PNG"),
+        ("Ctrl + Shift + S", "Сохранить как..."),
+        ("Ctrl + Shift + C", "Копировать в буфер обмена"),
+        ("Ctrl + R", "Обновить скриншот"),
+        ("Ctrl + X", "Обрезать по выделению"),
+        ("Ctrl + Z", "Отменить обрезку"),
+        ("F1", "Это окно"),
+        (None, "Выделение (ROI)"),
+        ("Левая кнопка мыши", "Выделить область"),
+        ("← → ↑ ↓", "Сдвинуть область на 1 px"),
+        ("Shift + стрелка", "Расширить область в сторону стрелки"),
+        ("«−» + стрелка", "Сузить область в сторону стрелки"),
+        ("Ctrl + …", "Шаг 10 px вместо 1 px"),
+    ]
+
+    def on_info(self, event):
+        """Показывает всплывающее окно со списком клавиш управления программой."""
+        with wx.Dialog(self, title="Управление программой") as dlg:
+            grid = wx.FlexGridSizer(cols=2, vgap=4, hgap=20)
+            bold = dlg.GetFont().Bold()
+            for keys, action in self.HELP_KEYS:
+                if keys is None:
+                    title = wx.StaticText(dlg, label=action)
+                    title.SetFont(bold)
+                    grid.Add(title, 0, wx.TOP, 8)
+                    grid.AddSpacer(0)
+                    continue
+                key_text = wx.StaticText(dlg, label=keys)
+                key_text.SetFont(bold)
+                grid.Add(key_text)
+                grid.Add(wx.StaticText(dlg, label=action))
+
+            sizer = wx.BoxSizer(wx.VERTICAL)
+            sizer.Add(grid, 1, wx.ALL | wx.EXPAND, 15)
+            sizer.Add(dlg.CreateButtonSizer(wx.OK), 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+            dlg.SetSizerAndFit(sizer)
+            dlg.CentreOnParent()
+            dlg.ShowModal()
+
     def on_browse_folder(self, event):
         """Открывает диалог выбора папки и обновляет путь сохранения (с сохранением в конфиг)."""
         with wx.DirDialog(self, "Выберите папку для сохранения скриншотов", str(self.save_dir),
@@ -531,59 +774,33 @@ class MainFrame(wx.Frame):
         """Возвращает скриншот выбранного экрана (0 = все экраны, 1..N = конкретный экран).
 
         Особенности:
-        - Делает один полный скриншот и кэширует его.
-        - Учитывает, что wx.Display.GetGeometry() использует Y=0 внизу (как в OpenGL),
-          а ImageGrab.grab() — Y=0 вверху (как в Windows GDI).
-        - Использует смещение Y-оси, вычисленное по первому экрану (как эталон).
+        - Делает один полный скриншот всего виртуального рабочего стола и кэширует его.
+        - Координаты мониторов (EnumDisplayMonitors) заданы относительно основного экрана
+          и могут быть отрицательными, а левый верхний угол снимка ImageGrab.grab(all_screens=True)
+          соответствует точке (min(left), min(top)) по всем мониторам. Поэтому для обрезки
+          координаты монитора сдвигаются на начало виртуального рабочего стола.
         """
 
         # Делаем полный скриншот один раз
-        if not hasattr(self, '_cached_full_screenshot') or self._cached_full_screenshot is None:
+        if self._cached_full_screenshot is None:
             self._cached_full_screenshot = ImageGrab.grab(all_screens=True)
-            # print(f"[DEBUG] Полный скриншот: {self._cached_full_screenshot.size}")
 
         full_img = self._cached_full_screenshot
-        full_w, full_h = full_img.size
 
-        if screen_index == 0:
+        if screen_index == 0 or not (1 <= screen_index <= len(self.displays)):
             return full_img.copy()
 
-        # Получаем координаты первого экрана — как эталон для Y-смещения
-        if not self.displays:
-            return full_img.copy()
+        # Начало виртуального рабочего стола (левый верхний угол полного снимка)
+        origin_x = min(d["rect"][0] for d in self.displays)
+        origin_y = min(d["rect"][1] for d in self.displays)
 
-        x0, y0, w0, h0 = self.displays[0]["rect"]
+        x, y, w, h = self.displays[screen_index - 1]["rect"]
+        left, top = x - origin_x, y - origin_y
+        bbox = (left, top, left + w, top + h)
 
-        # Вычисляем Y-смещение:
-        # Если y0 > 0, значит Y=0 находится ниже нижней границы первого экрана → сдвигаем вверх
-        # Если y0 < 0, значит Y=0 находится выше верхней границы → сдвигаем вниз
-        # ofset_y = -y0 — это "коррекция", чтобы Y=0 совпал с нижней границей в системе ImageGrab
-        ofset_y = -y0
-
-        # Конкретный экран
-        if 1 <= screen_index <= len(self.displays):
-            x, y, w, h = self.displays[screen_index - 1]["rect"]
-
-            # Для экранов, кроме первого — инвертируем смещение (т.к. они по-разному расположены относительно Y=0)
-            if screen_index > 1:
-                ofset_y = -ofset_y
-
-            # Вычисляем y_top и y_bottom в системе ImageGrab (Y=0 сверху)
-            if y >= 0:
-                # y >= 0: экран выше Y=0 → y_top = full_h - (y + ofset_y + h)
-                y_top = full_h - (y + ofset_y + h)
-            else:
-                # y < 0: экран ниже Y=0 → y_top = 0 (начало изображения)
-                y_top = 0
-
-            y_bottom = y_top + h
-            bbox = (x, y_top, x + w, y_bottom)
-
-            print(f"[DEBUG] Screen {screen_index}: sys=(x:{x},y:{y},w:{w},h:{h}), "
-                  f"ofset_y:{ofset_y}, bbox=(x1:{x},y1:{y_top},x2:{x + w},y2:{y_bottom})")
-            return full_img.crop(bbox)
-        else:
-            return full_img.copy()
+        print(f"[DEBUG] Screen {screen_index}: sys=(x:{x},y:{y},w:{w},h:{h}), "
+              f"origin=({origin_x},{origin_y}), full={full_img.size}, bbox={bbox}")
+        return full_img.crop(bbox)
 
     def on_screen_change(self, event):
         """Обработчик смены экрана: сбрасывает кэш скриншота, делает новый и обновляет панель.
@@ -591,14 +808,21 @@ class MainFrame(wx.Frame):
 
         self._cached_full_screenshot = None
         new_screenshot = self._capture_screen(self.choice_screen.GetSelection())
-        self.panel.original_pil = new_screenshot.convert("RGB")
-        self.panel.display_pil = self.panel.original_pil.copy()
-        self.panel.final_roi = None
-        self.panel.start_point = None
-        self.panel.current_point = None
-        self.panel._update_display_image()
-        self.panel.Refresh()
+        self.panel.set_image(new_screenshot)
+        self.btn_undo_crop.Enable(False)
         # self.btn_save.Enable(False)
+
+    def on_crop(self, event):
+        """Обрезает скриншот по выделенной области, чтобы затем сохранить или скопировать результат."""
+        if not self.panel.crop_to_roi():
+            wx.MessageBox("Сначала выделите область для обрезки!", "Обрезка", wx.OK | wx.ICON_INFORMATION)
+            return
+        self.btn_undo_crop.Enable(True)
+
+    def on_undo_crop(self, event):
+        """Отменяет последнюю обрезку."""
+        self.panel.undo_crop()
+        self.btn_undo_crop.Enable(bool(self.panel.crop_history))
 
     def on_roi_change(self, event):
         """Обновляет состояние кнопок: включает «Сохранить» и «Копировать», если ROI выбран."""
@@ -608,18 +832,34 @@ class MainFrame(wx.Frame):
         # self.btn_copy.Enable(has_roi)
         event.Skip()
 
+    def on_prtscr(self, event):
+        """PrtScr: прячет окно программы, делает новый снимок и показывает окно с ним."""
+        if self.IsShown() and not self.IsIconized():
+            self.Hide()
+            wx.CallLater(300, self._capture_and_show)  # даём Windows убрать окно с экрана
+        else:
+            self._capture_and_show()
+
+    def _capture_and_show(self):
+        """Делает новый скриншот выбранного экрана и выводит окно программы на передний план."""
+        self.on_refresh(None)
+        self.Show()
+        self.Iconize(False)
+        self.Raise()
+        self.panel.SetFocus()
+
+    def on_close(self, event):
+        """Освобождает глобальную клавишу PrtScr при закрытии программы."""
+        self.UnregisterHotKey(self.HOTKEY_PRTSCR_ID)
+        event.Skip()
+
     def on_refresh(self, event):
         """Обновляет скриншот: сбрасывает кэш, делает новый и сбрасывает выделение."""
         self._cached_full_screenshot = None  # сброс кэша
         screen_idx = self.choice_screen.GetSelection()
         new_screenshot = self._capture_screen(screen_idx)
-        self.panel.original_pil = new_screenshot.convert("RGB")
-        self.panel.display_pil = new_screenshot.convert("RGB").copy()
-        self.panel.final_roi = None
-        self.panel.start_point = None
-        self.panel.current_point = None
-        self.panel._update_display_image()
-        self.panel.Refresh()
+        self.panel.set_image(new_screenshot)
+        self.btn_undo_crop.Enable(False)
         # self.btn_save.Enable(False)
 
 
