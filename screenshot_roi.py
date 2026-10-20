@@ -1,7 +1,10 @@
 import wx
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageFilter, ImageDraw, ImageFont
 from datetime import datetime
+from functools import lru_cache
+import copy
 import json
+import math
 from pathlib import Path
 import sys
 from wx.lib.embeddedimage import PyEmbeddedImage
@@ -189,6 +192,63 @@ def InfoMessageBox(title: str, text: str, show_time: int, style: int = 0, sound:
     ctypes.windll.user32.MessageBoxA(0, text.encode('cp1251'), title, MB_SYSTEMMODAL | MB_ICONINFORMATION)
 
 
+# ---------- Слой объектов (стрелки и надписи) ----------
+# Объект — словарь в координатах оригинального изображения:
+#   {"type": "arrow", "p1": (x, y), "p2": (x, y), "color": (r, g, b), "width": px}
+#   {"type": "text", "pos": (x, y), "text": str, "color": (r, g, b), "size": px}
+
+_MEASURE_DRAW = ImageDraw.Draw(Image.new("RGB", (1, 1)))  # только для измерения размеров текста
+
+
+@lru_cache(maxsize=64)
+def _load_font(size: int):
+    """Шрифт для надписей: Arial (есть в Windows, поддерживает кириллицу), иначе встроенный шрифт PIL."""
+    size = max(1, int(size))
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except OSError:
+        try:
+            return ImageFont.load_default(size)  # Pillow 10.1+
+        except TypeError:
+            return ImageFont.load_default()
+
+
+def _text_bbox(ann, scale: float = 1.0):
+    """Габариты надписи (x1, y1, x2, y2) при заданном масштабе."""
+    x, y = ann["pos"]
+    font = _load_font(round(ann["size"] * scale))
+    return _MEASURE_DRAW.multiline_textbbox((x * scale, y * scale), ann["text"], font=font)
+
+
+def _draw_arrow(draw, p1, p2, width, color):
+    """Рисует стрелку от p1 к p2: линия и залитый треугольный наконечник."""
+    x1, y1 = p1
+    x2, y2 = p2
+    length = math.hypot(x2 - x1, y2 - y1)
+    if length < 1:
+        return
+    head = min(max(width * 4, 6), length)  # длина наконечника
+    ux, uy = (x2 - x1) / length, (y2 - y1) / length
+    bx, by = x2 - ux * head, y2 - uy * head  # основание наконечника
+    half = head * 0.5
+    draw.line([(x1, y1), (bx, by)], fill=color, width=width)
+    draw.polygon([(x2, y2), (bx - uy * half, by + ux * half), (bx + uy * half, by - ux * half)], fill=color)
+
+
+def draw_annotations(img: Image.Image, annotations, scale: float = 1.0):
+    """Рисует объекты слоя на изображении img (на месте); scale — масштаб img относительно оригинала."""
+    draw = ImageDraw.Draw(img)
+    for ann in annotations:
+        if ann["type"] == "arrow":
+            p1 = (ann["p1"][0] * scale, ann["p1"][1] * scale)
+            p2 = (ann["p2"][0] * scale, ann["p2"][1] * scale)
+            _draw_arrow(draw, p1, p2, max(1, round(ann["width"] * scale)), ann["color"])
+        elif ann["type"] == "text":
+            x, y = ann["pos"]
+            draw.multiline_text((x * scale, y * scale), ann["text"], fill=ann["color"],
+                                font=_load_font(round(ann["size"] * scale)))
+
+
 class ROISelectorPanel(wx.ScrolledWindow):
     def __init__(self, parent, pil_image: Image.Image):
         super().__init__(parent, style=wx.VSCROLL | wx.HSCROLL | wx.WANTS_CHARS)
@@ -198,12 +258,9 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
         self.Bind(wx.EVT_LEFT_UP, self.on_left_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
+        self.Bind(wx.EVT_LEFT_DCLICK, self.on_left_dclick)
         self.Bind(wx.EVT_SIZE, self.on_size)
         self.Bind(wx.EVT_KEY_DOWN, self.on_key_down)
-        self.Bind(wx.EVT_KEY_UP, self.on_key_up)
-
-        # Удерживаемая клавиша «-» для уменьшения ROI стрелками
-        self._held_keys = set()
 
         # Оригинальное изображение (PIL)
         self.original_pil = pil_image
@@ -215,8 +272,18 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.current_point = None
         self.final_roi = None  # (x1, y1, x2, y2)
 
-        # История обрезок (для отмены)
-        self.crop_history = []
+        # Слой объектов поверх скриншота (стрелки и надписи)
+        self.annotations = []
+        self.selected = None      # индекс выбранного объекта
+        self.tool = "select"      # "select" | "arrow" | "text"
+        self.drag = None          # текущее перетаскивание: рисование стрелки или перенос объекта
+        self.pen_color = (255, 0, 0)
+        self.pen_width = 3        # толщина стрелки в экранных пикселях
+        self.font_size = 20       # размер шрифта в экранных пикселях
+
+        # История для отмены: [(изображение, объекты), ...] — обрезка, блюр и изменения слоя
+        self.history = []
+        self.on_history_changed = None  # вызывается при изменении истории (обновить кнопку «Отменить»)
 
         # Подготовка к отображению
         self._update_display_image()
@@ -247,46 +314,99 @@ class ROISelectorPanel(wx.ScrolledWindow):
         event.Skip()
 
     def on_left_down(self, event):
-        """Начало выделения ROI: сохраняет начальную точку в координатах оригинального изображения."""
+        """Нажатие мыши: в зависимости от инструмента начинает выделение ROI, перенос объекта,
+            рисование стрелки или ставит надпись. Рисовать можно только в пределах изображения.
+            """
         self.SetFocus()  # чтобы стрелки клавиатуры приходили в панель
         pos = event.GetPosition()
-        x, y = self._screen_to_original(pos)
-        self.start_point = (x, y)
-        self.current_point = (x, y)
+        inside = self._inside_image(pos)
+        point = self._screen_to_original(pos)
+
+        if self.tool == "arrow":
+            if inside:
+                self.drag = {"mode": "arrow", "ann": {"type": "arrow", "p1": point, "p2": point,
+                                                      "color": self.pen_color,
+                                                      "width": max(1, round(self.pen_width / self.scale))}}
+        elif self.tool == "text":
+            if inside:
+                self._add_text(point)
+        else:
+            idx = self._hit_test(point) if inside else None
+            self.selected = idx
+            if idx is not None:
+                self.drag = {"mode": "move", "last": point, "moved": False,
+                             "before": (self.original_pil, copy.deepcopy(self.annotations))}
+            else:
+                self.start_point = point
+                self.current_point = point
         self.Refresh()
 
     def on_left_up(self, event):
-        """Завершение выделения ROI: нормализует координаты и сохраняет как final_roi."""
+        """Отпускание мыши: завершает рисование стрелки, перенос объекта или выделение ROI."""
+        if self.drag:
+            drag, self.drag = self.drag, None
+            if drag["mode"] == "arrow":
+                ann = drag["ann"]
+                (x1, y1), (x2, y2) = ann["p1"], ann["p2"]
+                if math.hypot(x2 - x1, y2 - y1) * self.scale >= 5:  # случайный клик стрелку не создаёт
+                    self._push_history()
+                    self.annotations.append(ann)
+            elif drag["mode"] == "move" and drag["moved"]:
+                self._push_history(drag["before"])
+            self.Refresh()
+            return
         if self.start_point and self.current_point:
             x1, y1 = self.start_point
             x2, y2 = self.current_point
             x1, x2 = sorted([x1, x2])
             y1, y2 = sorted([y1, y2])
-            self.final_roi = (x1, y1, x2, y2)
+            # Простой клик (без протяжки) снимает выделение: тогда сохраняется весь текущий кадр
+            self.final_roi = (x1, y1, x2, y2) if x2 - x1 >= 2 and y2 - y1 >= 2 else None
             self.start_point = None
             self.current_point = None
             self.Refresh()
             # wx.MessageBox(f"ROI сохранено: ({x1}, {y1}) — ({x2}, {y2})", "Готово", wx.OK | wx.ICON_INFORMATION)
 
     def on_motion(self, event):
-        """Отслеживает движение мыши при выделении: обновляет текущую точку и перерисовывает."""
+        """Движение мыши: тянет стрелку, переносит объект или обновляет выделение ROI."""
+        if self.drag:
+            point = self._screen_to_original(event.GetPosition())
+            if self.drag["mode"] == "arrow":
+                self.drag["ann"]["p2"] = point
+            elif self.drag["mode"] == "move" and self.selected is not None:
+                lx, ly = self.drag["last"]
+                if (point[0], point[1]) != (lx, ly):
+                    self._shift_annotation(self.annotations[self.selected], point[0] - lx, point[1] - ly)
+                    self.drag["last"] = point
+                    self.drag["moved"] = True
+            self.Refresh()
+            return
         if self.start_point:
             pos = event.GetPosition()
             self.current_point = self._screen_to_original(pos)
             self.Refresh()
 
-    # Коды клавиши «-» (основная клавиатура и цифровой блок)
-    _MINUS_KEYS = {ord('-'), wx.WXK_SUBTRACT, wx.WXK_NUMPAD_SUBTRACT}
     _ARROW_KEYS = {wx.WXK_LEFT, wx.WXK_RIGHT, wx.WXK_UP, wx.WXK_DOWN,
                    wx.WXK_NUMPAD_LEFT, wx.WXK_NUMPAD_RIGHT, wx.WXK_NUMPAD_UP, wx.WXK_NUMPAD_DOWN}
 
     def on_key_down(self, event):
-        """Стрелки двигают ROI; Shift + стрелка расширяет ROI в сторону стрелки,
-            «-» + стрелка сужает ROI в сторону стрелки. С Ctrl шаг 10 пикселей вместо 1.
+        """Стрелки двигают ROI (с Shift шаг 10 пикселей вместо 1);
+            Ctrl + стрелка сужает ROI в сторону стрелки, Ctrl + Shift + стрелка расширяет ROI в сторону стрелки.
             """
         key = event.GetKeyCode()
-        if key in self._MINUS_KEYS:
-            self._held_keys.add(key)
+        if key in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE, wx.WXK_BACK) and self.selected is not None:
+            self._push_history()
+            del self.annotations[self.selected]
+            self.selected = None
+            self.Refresh()
+            return
+        if key == wx.WXK_ESCAPE and (self.selected is not None or self.final_roi):
+            # Esc снимает выбор объекта, а если объект не выбран — выделение области
+            if self.selected is not None:
+                self.selected = None
+            else:
+                self.final_roi = None
+            self.Refresh()
             return
         if key not in self._ARROW_KEYS or not self.final_roi:
             event.Skip()
@@ -294,19 +414,12 @@ class ROISelectorPanel(wx.ScrolledWindow):
 
         dx = {wx.WXK_LEFT: -1, wx.WXK_NUMPAD_LEFT: -1, wx.WXK_RIGHT: 1, wx.WXK_NUMPAD_RIGHT: 1}.get(key, 0)
         dy = {wx.WXK_UP: -1, wx.WXK_NUMPAD_UP: -1, wx.WXK_DOWN: 1, wx.WXK_NUMPAD_DOWN: 1}.get(key, 0)
-        step = 10 if event.ControlDown() else 1
 
-        if event.ShiftDown():
-            self.resize_roi(dx * step, dy * step, grow=True)
-        elif self._held_keys & self._MINUS_KEYS:
-            self.resize_roi(dx * step, dy * step, grow=False)
+        if event.ControlDown():
+            self.resize_roi(dx, dy, grow=event.ShiftDown())
         else:
+            step = 10 if event.ShiftDown() else 1
             self.move_roi(dx * step, dy * step)
-
-    def on_key_up(self, event):
-        """Отпускание «-»: стрелки снова двигают ROI целиком."""
-        self._held_keys.discard(event.GetKeyCode())
-        event.Skip()
 
     def move_roi(self, dx, dy):
         """Сдвигает ROI на (dx, dy) пикселей оригинала, не выходя за границы изображения."""
@@ -347,6 +460,140 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.final_roi = (x1, y1, x2, y2)
         self.Refresh()
 
+    def on_left_dclick(self, event):
+        """Двойной клик по надписи в режиме «Выделение» — изменить её текст."""
+        if self.tool != "select":
+            event.Skip()
+            return
+        pos = event.GetPosition()
+        idx = self._hit_test(self._screen_to_original(pos)) if self._inside_image(pos) else None
+        if idx is None or self.annotations[idx]["type"] != "text":
+            return
+        ann = self.annotations[idx]
+        text = self._ask_text(ann["text"])
+        if text is not None and text != ann["text"]:
+            self._push_history()
+            ann["text"] = text
+            self._shift_annotation(ann, 0, 0)  # удержать в пределах изображения
+            self.selected = idx
+            self.Refresh()
+
+    def set_tool(self, tool: str):
+        """Переключает инструмент: "select" — выделение и перенос объектов, "arrow" — стрелка, "text" — надпись."""
+        self.tool = tool
+        self.drag = None
+        self.start_point = None
+        self.current_point = None
+        if tool != "select":
+            self.selected = None
+        cursor = {"arrow": wx.CURSOR_CROSS, "text": wx.CURSOR_IBEAM}.get(tool, wx.CURSOR_ARROW)
+        self.SetCursor(wx.Cursor(cursor))
+        self.Refresh()
+
+    def set_style(self, color=None, width=None, font_size=None):
+        """Задаёт цвет, толщину стрелки и размер шрифта (в экранных пикселях) для новых объектов
+            и применяет их к выбранному объекту.
+            """
+        if color is not None:
+            self.pen_color = color
+        if width is not None:
+            self.pen_width = width
+        if font_size is not None:
+            self.font_size = font_size
+        if self.selected is None:
+            return
+        ann = copy.deepcopy(self.annotations[self.selected])
+        if color is not None:
+            ann["color"] = color
+        if width is not None and ann["type"] == "arrow":
+            ann["width"] = max(1, round(width / self.scale))
+        if font_size is not None and ann["type"] == "text":
+            ann["size"] = max(1, round(font_size / self.scale))
+        if ann != self.annotations[self.selected]:
+            self._push_history()
+            self.annotations[self.selected] = ann
+            self._shift_annotation(ann, 0, 0)
+            self.Refresh()
+
+    def _ask_text(self, value: str = ""):
+        """Диалог ввода текста надписи. Возвращает текст или None, если отменено или пусто."""
+        with wx.TextEntryDialog(self, "Текст надписи:", "Надпись", value=value,
+                                style=wx.TextEntryDialogStyle | wx.TE_MULTILINE) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return None
+            text = dlg.GetValue()
+        return text if text.strip() else None
+
+    def _add_text(self, point):
+        """Ставит надпись в точку point (координаты оригинала) после ввода текста в диалоге."""
+        text = self._ask_text()
+        if text is None:
+            return
+        ann = {"type": "text", "pos": point, "text": text, "color": self.pen_color,
+               "size": max(1, round(self.font_size / self.scale))}
+        self._shift_annotation(ann, 0, 0)  # надпись у края сдвигается внутрь изображения
+        self._push_history()
+        self.annotations.append(ann)
+
+    def _ann_bounds(self, ann):
+        """Габариты объекта (x1, y1, x2, y2) в координатах оригинала: концы стрелки или прямоугольник текста."""
+        if ann["type"] == "arrow":
+            (x1, y1), (x2, y2) = ann["p1"], ann["p2"]
+            return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+        return _text_bbox(ann)
+
+    def _shift_annotation(self, ann, dx, dy):
+        """Сдвигает объект на (dx, dy), не выпуская его за границы изображения."""
+        orig_w, orig_h = self.original_pil.size
+        x1, y1, x2, y2 = self._ann_bounds(ann)
+        dx = int(max(-x1, min(dx, orig_w - 1 - x2)))
+        dy = int(max(-y1, min(dy, orig_h - 1 - y2)))
+        if ann["type"] == "arrow":
+            ann["p1"] = (ann["p1"][0] + dx, ann["p1"][1] + dy)
+            ann["p2"] = (ann["p2"][0] + dx, ann["p2"][1] + dy)
+        else:
+            ann["pos"] = (ann["pos"][0] + dx, ann["pos"][1] + dy)
+
+    def _hit_test(self, point):
+        """Индекс верхнего объекта под точкой (координаты оригинала) или None."""
+        px, py = point
+        tol = 6 / self.scale  # допуск попадания — 6 экранных пикселей
+        for idx in range(len(self.annotations) - 1, -1, -1):
+            ann = self.annotations[idx]
+            if ann["type"] == "arrow":
+                (x1, y1), (x2, y2) = ann["p1"], ann["p2"]
+                seg = (x2 - x1) ** 2 + (y2 - y1) ** 2
+                t = 0 if seg == 0 else max(0, min(1, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / seg))
+                dist = math.hypot(px - (x1 + t * (x2 - x1)), py - (y1 + t * (y2 - y1)))
+                if dist <= ann["width"] * 2 + tol:
+                    return idx
+            else:
+                x1, y1, x2, y2 = _text_bbox(ann)
+                if x1 - tol <= px <= x2 + tol and y1 - tol <= py <= y2 + tol:
+                    return idx
+        return None
+
+    def _push_history(self, state=None):
+        """Кладёт состояние (изображение, объекты) в историю отмены; по умолчанию — текущее."""
+        self.history.append(state or (self.original_pil, copy.deepcopy(self.annotations)))
+        self._notify_history()
+
+    def _notify_history(self):
+        if self.on_history_changed:
+            self.on_history_changed()
+
+    def _image_offset(self):
+        """Смещение левого верхнего угла изображения в окне (изображение центрируется)."""
+        disp_w, disp_h = self.display_pil.size
+        client_w, client_h = self.GetClientSize().Get()
+        return (client_w - disp_w) // 2, (client_h - disp_h) // 2
+
+    def _inside_image(self, screen_pos) -> bool:
+        """Попадает ли экранная точка на изображение."""
+        x_off, y_off = self._image_offset()
+        disp_w, disp_h = self.display_pil.size
+        return 0 <= screen_pos[0] - x_off < disp_w and 0 <= screen_pos[1] - y_off < disp_h
+
     def _screen_to_original(self, screen_pos):
         """Преобразует экранные координаты (пиксели окна) в координаты оригинального изображения.
 
@@ -382,16 +629,16 @@ class ROISelectorPanel(wx.ScrolledWindow):
         dc.SetBackground(wx.Brush(wx.WHITE))
         dc.Clear()
 
-        # Рисуем изображение
-        if self.display_pil.mode == "RGB":
-            data = self.display_pil.tobytes()
-            w, h = self.display_pil.size
-            bitmap = wx.Bitmap.FromBuffer(w, h, data)
-        else:
-            rgb = self.display_pil.convert("RGB")
-            data = rgb.tobytes()
-            w, h = rgb.size
-            bitmap = wx.Bitmap.FromBuffer(w, h, data)
+        # Рисуем изображение вместе со слоем объектов (и стрелкой, которую сейчас тянут)
+        frame = self.display_pil.convert("RGB")
+        annotations = self.annotations
+        if self.drag and self.drag["mode"] == "arrow":
+            annotations = annotations + [self.drag["ann"]]
+        if annotations:
+            frame = frame.copy() if frame is self.display_pil else frame
+            draw_annotations(frame, annotations, frame.width / self.original_pil.width)
+        w, h = frame.size
+        bitmap = wx.Bitmap.FromBuffer(w, h, frame.tobytes())
 
         client_w, client_h = self.GetClientSize().Get()
         x = (client_w - w) // 2
@@ -424,6 +671,17 @@ class ROISelectorPanel(wx.ScrolledWindow):
             dc.SetBrush(wx.TRANSPARENT_BRUSH)
             dc.DrawRectangle(int(x1_s), int(y1_s), int(x2_s - x1_s), int(y2_s - y1_s))
 
+        # Рамка вокруг выбранного объекта
+        if self.selected is not None and self.selected < len(self.annotations):
+            k = w / self.original_pil.width
+            ann = self.annotations[self.selected]
+            bx1, by1, bx2, by2 = self._ann_bounds(ann)
+            pad = 4 + (ann["width"] * 2 * k if ann["type"] == "arrow" else 0)
+            dc.SetPen(wx.Pen(wx.Colour(0, 120, 255), 1, wx.PENSTYLE_SHORT_DASH))
+            dc.SetBrush(wx.TRANSPARENT_BRUSH)
+            dc.DrawRectangle(int(x + bx1 * k - pad), int(y + by1 * k - pad),
+                             int((bx2 - bx1) * k + 2 * pad), int((by2 - by1) * k + 2 * pad))
+
     def _original_to_screen(self, orig_point):
         """Преобразует координаты оригинального изображения в экранные (пиксели окна).
             Обратная операция к _screen_to_original: учитывает масштаб и центрирование.
@@ -438,17 +696,23 @@ class ROISelectorPanel(wx.ScrolledWindow):
     def get_roi_image(self) -> Image.Image:
         """Возвращает выделенную область (ROI) как PIL.Image, обрезанную по координатам final_roi.
 
-            Если ROI не выбран — возвращает original_pil.
+            Объекты слоя (стрелки, надписи) впечатываются в результат. Если ROI не выбран — всё изображение.
             """
+        image = self.original_pil
+        if self.annotations:
+            image = image.copy()
+            draw_annotations(image, self.annotations)
         if not self.final_roi:
-            return self.original_pil
+            return image
         x1, y1, x2, y2 = self.final_roi
-        return self.original_pil.crop((x1, y1, x2, y2))
+        return image.crop((x1, y1, x2, y2))
 
     def set_image(self, pil_image: Image.Image):
-        """Загружает новый скриншот: сбрасывает выделение и историю обрезок."""
-        self.crop_history = []
+        """Загружает новый скриншот: сбрасывает выделение, объекты слоя и историю отмены."""
+        self.history = []
+        self.annotations = []
         self._show_image(pil_image.convert("RGB"))
+        self._notify_history()
 
     def _show_image(self, pil_image: Image.Image):
         """Показывает изображение в панели и сбрасывает выделение."""
@@ -457,11 +721,13 @@ class ROISelectorPanel(wx.ScrolledWindow):
         self.final_roi = None
         self.start_point = None
         self.current_point = None
+        self.selected = None
+        self.drag = None
         self._update_display_image()
         self.Refresh()
 
     def crop_to_roi(self) -> bool:
-        """Обрезает изображение по выделенной области (ROI); прежнее изображение кладётся в историю.
+        """Обрезает изображение и слой объектов по выделенной области (ROI); прежнее состояние кладётся в историю.
 
             Возвращает False, если область не выбрана или имеет нулевой размер.
             """
@@ -470,15 +736,64 @@ class ROISelectorPanel(wx.ScrolledWindow):
         x1, y1, x2, y2 = self.final_roi
         if x2 - x1 < 1 or y2 - y1 < 1:
             return False
-        self.crop_history.append(self.original_pil)
+        self._push_history()
+        # Объекты слоя переносятся в координаты обрезанного изображения; полностью вне области — удаляются
+        kept = []
+        for ann in self.annotations:
+            bx1, by1, bx2, by2 = self._ann_bounds(ann)
+            if bx2 < x1 or bx1 > x2 or by2 < y1 or by1 > y2:
+                continue
+            ann = copy.deepcopy(ann)
+            if ann["type"] == "arrow":
+                ann["p1"] = (ann["p1"][0] - x1, ann["p1"][1] - y1)
+                ann["p2"] = (ann["p2"][0] - x1, ann["p2"][1] - y1)
+            else:
+                ann["pos"] = (ann["pos"][0] - x1, ann["pos"][1] - y1)
+            kept.append(ann)
+        self.annotations = kept
         self._show_image(self.original_pil.crop((x1, y1, x2, y2)))
         return True
 
-    def undo_crop(self) -> bool:
-        """Возвращает изображение, каким оно было до последней обрезки. False — если отменять нечего."""
-        if not self.crop_history:
+    def blur_roi(self) -> bool:
+        """Пикселизирует выделенную область (ROI) так, чтобы текст в ней нельзя было прочитать.
+
+            Область сначала размывается, затем уменьшается до крупных блоков и растягивается обратно
+            без сглаживания. Прежнее изображение кладётся в историю (отменяется как обрезка),
+            выделение остаётся на месте. Возвращает False, если область не выбрана или пустая.
+            """
+        if not self.final_roi:
             return False
-        self._show_image(self.crop_history.pop())
+        x1, y1, x2, y2 = self.final_roi
+        w, h = x2 - x1, y2 - y1
+        if w < 1 or h < 1:
+            return False
+        block = max(2, min(w, h) // 20)  # размер «пикселя»: не меньше 12 px, крупнее для больших областей
+        region = self.original_pil.crop((x1, y1, x2, y2)).filter(ImageFilter.GaussianBlur(block))
+        small = region.resize((max(1, w // block), max(1, h // block)), Image.BILINEAR)
+        pixelated = small.resize((w, h), Image.NEAREST)
+
+        self._push_history()
+        self.original_pil = self.original_pil.copy()  # блюр меняет только скриншот, стрелки и надписи не трогает
+        self.original_pil.paste(pixelated, (x1, y1))
+        self._update_display_image()
+        self.Refresh()
+        return True
+
+    def undo(self) -> bool:
+        """Отменяет последнее действие: обрезку, блюр или изменение слоя объектов. False — если отменять нечего."""
+        if not self.history:
+            return False
+        image, self.annotations = self.history.pop()
+        if image.size == self.original_pil.size:
+            # Размер не менялся (блюр или рисование) — выделение оставляем на месте
+            self.original_pil = image
+            self.selected = None
+            self.drag = None
+            self._update_display_image()
+            self.Refresh()
+        else:
+            self._show_image(image)
+        self._notify_history()
         return True
 
     def copy_to_clipboard(self):
@@ -563,6 +878,33 @@ class MainFrame(wx.Frame):
 
         # Панель с прокруткой
         self.panel = ROISelectorPanel(self, screenshot_pil)
+        self.panel.on_history_changed = lambda: self.btn_undo_crop.Enable(bool(self.panel.history))
+
+        # Панель инструментов: выделение / стрелка / текст, цвет, толщина, размер шрифта
+        tool_panel = wx.Panel(self)
+        tool_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        tool_sizer.Add(wx.StaticText(tool_panel, label="Инструмент: "), 0, wx.ALL | wx.CENTER, 5)
+        self.tool_buttons = {}
+        self.tool_ids = {}
+        for tool, label in (("select", "⬚ Выделение (V)"), ("arrow", "➜ Стрелка (A)"), ("text", "🔤 Текст (T)")):
+            btn = wx.ToggleButton(tool_panel, label=label)
+            btn.Bind(wx.EVT_TOGGLEBUTTON, lambda e, t=tool: self.set_tool(t))
+            tool_sizer.Add(btn, 0, wx.ALL, 5)
+            self.tool_buttons[tool] = btn
+            self.tool_ids[tool] = wx.NewIdRef()
+            self.Bind(wx.EVT_MENU, lambda e, t=tool: self.set_tool(t), id=self.tool_ids[tool])
+        self.tool_buttons["select"].SetValue(True)
+
+        self.color_picker = wx.ColourPickerCtrl(tool_panel, colour=wx.Colour(*self.panel.pen_color))
+        self.color_picker.Bind(wx.EVT_COLOURPICKER_CHANGED, self.on_style_change)
+        self.spin_width = wx.SpinCtrl(tool_panel, min=1, max=30, initial=self.panel.pen_width, size=(60, -1))
+        self.spin_width.Bind(wx.EVT_SPINCTRL, self.on_style_change)
+        self.spin_font = wx.SpinCtrl(tool_panel, min=6, max=120, initial=self.panel.font_size, size=(60, -1))
+        self.spin_font.Bind(wx.EVT_SPINCTRL, self.on_style_change)
+        for label, ctrl in (("Цвет:", self.color_picker), ("Толщина:", self.spin_width), ("Шрифт:", self.spin_font)):
+            tool_sizer.Add(wx.StaticText(tool_panel, label=label), 0, wx.LEFT | wx.CENTER, 15)
+            tool_sizer.Add(ctrl, 0, wx.ALL | wx.CENTER, 5)
+        tool_panel.SetSizer(tool_sizer)
 
         # Кнопки
         btn_panel = wx.Panel(self)
@@ -581,7 +923,9 @@ class MainFrame(wx.Frame):
 
         self.btn_crop = wx.Button(btn_panel, label="✂️ Обрезать по выделению")
         self.btn_crop.Bind(wx.EVT_BUTTON, self.on_crop)
-        self.btn_undo_crop = wx.Button(btn_panel, label="↩️ Отменить обрезку")
+        self.btn_blur = wx.Button(btn_panel, label="🔲 Заблюрить")
+        self.btn_blur.Bind(wx.EVT_BUTTON, self.on_blur)
+        self.btn_undo_crop = wx.Button(btn_panel, label="↩️ Отменить")
         self.btn_undo_crop.Bind(wx.EVT_BUTTON, self.on_undo_crop)
         self.btn_undo_crop.Enable(False)
 
@@ -593,6 +937,7 @@ class MainFrame(wx.Frame):
         btn_sizer.Add(self.btn_refresh, 0, wx.ALL, 5)
         btn_sizer.Add(self.btn_copy, 0, wx.ALL, 5)
         btn_sizer.Add(self.btn_crop, 0, wx.ALL, 5)
+        btn_sizer.Add(self.btn_blur, 0, wx.ALL, 5)
         btn_sizer.Add(self.btn_undo_crop, 0, wx.ALL, 5)
         btn_sizer.AddStretchSpacer()
         btn_sizer.Add(self.btn_info, 0, wx.ALL, 5)
@@ -605,8 +950,12 @@ class MainFrame(wx.Frame):
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord('C'), self.btn_copy.GetId()),
             (wx.ACCEL_CTRL, ord('R'), self.btn_refresh.GetId()),
             (wx.ACCEL_CTRL, ord('X'), self.btn_crop.GetId()),
+            (wx.ACCEL_CTRL, ord('B'), self.btn_blur.GetId()),
             (wx.ACCEL_CTRL, ord('Z'), self.btn_undo_crop.GetId()),
             (wx.ACCEL_NORMAL, wx.WXK_F1, self.btn_info.GetId()),
+            (wx.ACCEL_NORMAL, ord('V'), self.tool_ids["select"]),
+            (wx.ACCEL_NORMAL, ord('A'), self.tool_ids["arrow"]),
+            (wx.ACCEL_NORMAL, ord('T'), self.tool_ids["text"]),
         ])
         self.SetAcceleratorTable(self.accel_tbl)
 
@@ -614,6 +963,7 @@ class MainFrame(wx.Frame):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         main_sizer.Add(choice_panel, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(folder_panel, 0, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(tool_panel, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(self.panel, 1, wx.EXPAND)
         main_sizer.Add(btn_panel, 0, wx.EXPAND)
         self.SetSizer(main_sizer)
@@ -727,14 +1077,24 @@ class MainFrame(wx.Frame):
         ("Ctrl + Shift + C", "Копировать в буфер обмена"),
         ("Ctrl + R", "Обновить скриншот"),
         ("Ctrl + X", "Обрезать по выделению"),
-        ("Ctrl + Z", "Отменить обрезку"),
+        ("Ctrl + B", "Заблюрить выделенную область"),
+        ("Ctrl + Z", "Отменить последнее действие (обрезка, блюр, рисование)"),
         ("F1", "Это окно"),
         (None, "Выделение (ROI)"),
-        ("Левая кнопка мыши", "Выделить область"),
+        ("Левая кнопка мыши", "Выделить область, простой клик — снять выделение"),
         ("← → ↑ ↓", "Сдвинуть область на 1 px"),
-        ("Shift + стрелка", "Расширить область в сторону стрелки"),
-        ("«−» + стрелка", "Сузить область в сторону стрелки"),
-        ("Ctrl + …", "Шаг 10 px вместо 1 px"),
+        ("Shift + стрелка", "Сдвинуть область на 10 px"),
+        ("Ctrl + стрелка", "Сузить область в сторону стрелки"),
+        ("Ctrl + Shift + стрелка", "Расширить область в сторону стрелки"),
+        (None, "Рисование"),
+        ("V / A / T", "Инструмент: выделение / стрелка / текст"),
+        ("Стрелка: протянуть мышью", "Нарисовать стрелку (наконечник — где отпустили)"),
+        ("Текст: клик", "Поставить надпись в точку клика"),
+        ("Выделение: клик по объекту", "Выбрать объект, протянуть — переместить"),
+        ("Двойной клик по надписи", "Изменить текст"),
+        ("Цвет / толщина / шрифт", "Применяются к новым и к выбранному объекту"),
+        ("Delete", "Удалить выбранный объект"),
+        ("Esc", "Снять выбор объекта, повторно — выделение области"),
     ]
 
     def on_info(self, event):
@@ -819,10 +1179,29 @@ class MainFrame(wx.Frame):
             return
         self.btn_undo_crop.Enable(True)
 
+    def on_blur(self, event):
+        """Пикселизирует выделенную область, чтобы скрыть текст и другие данные."""
+        if not self.panel.blur_roi():
+            wx.MessageBox("Сначала выделите область для блюра!", "Заблюрить", wx.OK | wx.ICON_INFORMATION)
+            return
+        self.btn_undo_crop.Enable(True)
+
     def on_undo_crop(self, event):
-        """Отменяет последнюю обрезку."""
-        self.panel.undo_crop()
-        self.btn_undo_crop.Enable(bool(self.panel.crop_history))
+        """Отменяет последнее действие: обрезку, блюр или рисование."""
+        self.panel.undo()
+
+    def set_tool(self, tool: str):
+        """Переключает инструмент рисования и состояние кнопок-переключателей."""
+        for name, btn in self.tool_buttons.items():
+            btn.SetValue(name == tool)
+        self.panel.set_tool(tool)
+        self.panel.SetFocus()
+
+    def on_style_change(self, event):
+        """Цвет, толщина или размер шрифта изменены: применяем к новым объектам и к выбранному объекту."""
+        colour = self.color_picker.GetColour()
+        self.panel.set_style(color=(colour.Red(), colour.Green(), colour.Blue()),
+                             width=self.spin_width.GetValue(), font_size=self.spin_font.GetValue())
 
     def on_roi_change(self, event):
         """Обновляет состояние кнопок: включает «Сохранить» и «Копировать», если ROI выбран."""
